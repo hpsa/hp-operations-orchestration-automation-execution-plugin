@@ -1,9 +1,15 @@
-// (c) Copyright 2013 Hewlett-Packard Development Company, L.P. 
+// (c) Copyright 2013 Hewlett-Packard Development Company, L.P.
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 // The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 package com.hp.mercury.ci.jenkins.plugins;
 
+
+import com.hp.mercury.ci.jenkins.plugins.oo.core.oo10x.WaitExecutionResult;
+import com.hp.mercury.ci.jenkins.plugins.oo.entities.ExecutionResult;
+import com.hp.mercury.ci.jenkins.plugins.oo.entities.ExecutionStatusState;
+import com.hp.mercury.ci.jenkins.plugins.oo.entities.StepLog;
+import com.hp.mercury.ci.jenkins.plugins.oo.entities.TriggeredExecutionDetailsVO;
 import com.hp.mercury.ci.jenkins.plugins.oo.utils.MapValueCriteria;
 import com.hp.mercury.ci.jenkins.plugins.oo.utils.StringUtils;
 import com.hp.mercury.ci.jenkins.plugins.oo.core.*;
@@ -11,13 +17,25 @@ import com.hp.mercury.ci.jenkins.plugins.oo.encryption.TripleDES;
 import com.hp.mercury.ci.jenkins.plugins.oo.matcher.MatchStrategy;
 import com.hp.mercury.ci.jenkins.plugins.oo.ssl.FakeSocketFactory;
 import hudson.*;
+import hudson.matrix.*;
 import hudson.model.*;
 import hudson.util.FormValidation;
+import org.apache.commons.codec.binary.Base64;
+import org.apache.commons.httpclient.Cookie;
+import org.apache.commons.httpclient.cookie.CookieSpecBase;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.http.conn.ClientConnectionManager;
+import org.apache.http.conn.params.ConnManagerParams;
+import org.apache.http.conn.params.ConnPerRoute;
+import org.apache.http.conn.params.ConnPerRouteBean;
 import org.apache.http.conn.ssl.BrowserCompatHostnameVerifier;
 import org.apache.http.conn.ssl.SSLSocketFactory;
+import org.apache.http.cookie.CookieOrigin;
+import org.apache.http.cookie.CookieSpec;
+import org.apache.http.cookie.CookieSpecFactory;
+import org.apache.http.cookie.CookieSpecRegistry;
+import org.apache.http.cookie.params.CookieSpecPNames;
 import org.apache.http.impl.client.DefaultHttpClient;
 
 import com.hp.mercury.ci.jenkins.plugins.oo.utils.CollectionUtils;
@@ -32,6 +50,11 @@ import org.apache.http.auth.AuthScope;
 import org.apache.http.auth.UsernamePasswordCredentials;
 import org.apache.http.conn.scheme.Scheme;
 import org.apache.http.impl.conn.tsccm.ThreadSafeClientConnManager;
+import org.apache.http.impl.cookie.BestMatchSpec;
+import org.apache.http.impl.cookie.BestMatchSpecFactory;
+import org.apache.http.impl.cookie.BrowserCompatSpec;
+import org.apache.http.impl.cookie.BrowserCompatSpecFactory;
+import org.apache.http.impl.cookie.IgnoreSpecFactory;
 import org.apache.http.params.HttpConnectionParams;
 import org.apache.http.params.HttpParams;
 import org.apache.http.params.HttpProtocolParams;
@@ -39,12 +62,14 @@ import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.bind.JavaScriptMethod;
+import org.springframework.util.Assert;
 
 import javax.xml.bind.JAXB;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.net.*;
+import java.nio.charset.StandardCharsets;
 import java.security.*;
 import java.security.cert.CertificateException;
 import java.util.*;
@@ -62,6 +87,7 @@ public class OOBuildStep extends Builder {
                 }
             }
     );
+    private static byte[] encodedValue;
 
     public static List<String> possibleResults() {
         return RESULTS;
@@ -74,16 +100,20 @@ public class OOBuildStep extends Builder {
     private List<OOArg> args;
     private Result desiredResultType;
     private String valueToCompareWith;
+    private String stepExecutionTimeout;
+    private String runName;
     private MatchStrategy matchStrategy;
     private String retVariableToCheck;
     private String basepath;
-    private Boolean changeBuildResult;
+    // private Boolean changeBuildResult;
+    private static String globalKeystore;
     private static final Log LOG = LogFactory.getLog(OOBuildStep.class);
 
     private boolean abortBuildOnRunFailure = true;
 
     //we don't store this in the descriptor because it contains authentication data and we don't want it to be serialized to xml...
     private static DefaultHttpClient httpClient = null;
+
     public static DefaultHttpClient getHttpClient() {
 
         final DescriptorImpl descriptor = getDescriptorStatically();
@@ -92,21 +122,24 @@ public class OOBuildStep extends Builder {
 
             initializeHttpClient(descriptor);
         }
-
         return httpClient;
     }
 
+
+
     private static void initializeHttpClient(DescriptorImpl descriptor) {
 
-        httpClient = new DefaultHttpClient(new ThreadSafeClientConnManager());
+        final int maxConnectionsPerRoute = 100;
+        final int maxConnectionsTotal = 100;
 
+        ThreadSafeClientConnManager threadSafeClientConnManager = new ThreadSafeClientConnManager();
+        threadSafeClientConnManager.setDefaultMaxPerRoute(maxConnectionsPerRoute);
+        threadSafeClientConnManager.setMaxTotal(maxConnectionsTotal);
+
+        httpClient = new DefaultHttpClient(threadSafeClientConnManager);
         if (descriptor.isIgnoreSsl()) {
-            final ClientConnectionManager connectionManager = httpClient.getConnectionManager();
-            connectionManager.getSchemeRegistry().register(new Scheme("https",443, new FakeSocketFactory()));
-        }
-
-        else if (descriptor.getKeystorePath() != null) {
-            final ClientConnectionManager connectionManager = httpClient.getConnectionManager();
+            threadSafeClientConnManager.getSchemeRegistry().register(new Scheme("https", 443, new FakeSocketFactory()));
+        } else if (descriptor.getKeystorePath() != null) {
             try {
                 SSLSocketFactory sslSocketFactory = sslSocketFactoryFromCertificateFile(
                         descriptor.getKeystorePath(),
@@ -114,7 +147,7 @@ public class OOBuildStep extends Builder {
                 sslSocketFactory.setHostnameVerifier(new BrowserCompatHostnameVerifier());
                 // For less strict rules in dev mode you can try
                 //sslSocketFactory.setHostnameVerifier(new AllowAllHostnameVerifier());
-                connectionManager.getSchemeRegistry().register(new Scheme("https",443,sslSocketFactory));
+                threadSafeClientConnManager.getSchemeRegistry().register(new Scheme("https", 443, sslSocketFactory));
             } catch (NoSuchAlgorithmException e) {
                 LOG.error("Could not register https scheme: ", e);
             } catch (KeyManagementException e) {
@@ -141,19 +174,35 @@ public class OOBuildStep extends Builder {
             URL url = null;
             try {
                 url = new URL(s.getUrl());
-            }
-            catch (MalformedURLException mue) {
+            } catch (MalformedURLException mue) {
                 //can't happen, we pre-validate the URLS during configuration and set active to false if bad.
             }
 
+            //check why it doesn't use the credentials provider
             httpClient.getCredentialsProvider().setCredentials(
-                new AuthScope(url.getHost(), url.getPort()),
-
-                new UsernamePasswordCredentials(
-                        s.getUsername(),
-                        decrypt(s.getPassword())
-                ));
+                    new AuthScope(url.getHost(), url.getPort(), AuthScope.ANY_REALM, "basic"),
+                    new UsernamePasswordCredentials(
+                            s.getUsername(),
+                            decrypt(s.getPassword())
+                    )
+            );
         }
+
+    }
+
+    public static void setEncodedCredentials(String username, String password) {
+
+        if (username == null || username.length() == 0){
+            encodedValue = null;
+        } else {
+
+            String value = username + ":" + decrypt(password);
+            encodedValue = Base64.encodeBase64(value.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    public static byte[] getEncodedCredentials(){
+        return encodedValue;
     }
 
     private static SSLSocketFactory sslSocketFactoryFromCertificateFile(String keyStorePath, char[] password) throws
@@ -170,6 +219,8 @@ public class OOBuildStep extends Builder {
         //while similar to singleton patten in API, this provides a NEW instance.
         KeyStore trustore = KeyStore.getInstance("JKS");
 
+        globalKeystore = keyStorePath;
+
         trustore.load(fis, ksPassword);
         final SSLSocketFactory sslSocketFactory = new SSLSocketFactory(trustore);
 
@@ -182,11 +233,12 @@ public class OOBuildStep extends Builder {
             String basepath,
             String selectedFlow,
             List<OOArg> args,
-            Boolean changeBuildResult,
             String retVariableToCheck,
             int comparisonOrdinal,
             String valueToCompareWith,
-            String desiredResultType) throws Descriptor.FormException {
+            String desiredResultType,
+            String stepExecutionTimeout,
+            String runName) throws Descriptor.FormException {
 
         //this should never happen..
         if (ooServer == null || ooServer.isEmpty() || !OOAccessibilityLayer.getAvailableServers().contains(ooServer)) {
@@ -195,7 +247,7 @@ public class OOBuildStep extends Builder {
         }
 
         //this should never happen..
-        if (selectedFlow == null  || selectedFlow.isEmpty()) {
+        if (selectedFlow == null || selectedFlow.isEmpty()) {
             throw new Descriptor.FormException("illegal flow chosen. must be non null, non empty.", "selectedFlow");
         }
 
@@ -208,13 +260,15 @@ public class OOBuildStep extends Builder {
         this.selectedFlow = selectedFlow;
         this.args = args;
         this.basepath = basepath;
+        this.stepExecutionTimeout = stepExecutionTimeout;
+        this.runName = runName;
+        setStepExecutionTimeout(stepExecutionTimeout);
 
-        this.changeBuildResult = changeBuildResult;
-        if (changeBuildResult &&
+        if (
                 retVariableToCheck != null &&
-                valueToCompareWith != null &&
-                comparisonOrdinal != -1 &&
-                desiredResultType != null) {
+                        valueToCompareWith != null &&
+                        comparisonOrdinal != -1 &&
+                        desiredResultType != null) {
 
             this.retVariableToCheck = retVariableToCheck;
             this.valueToCompareWith = valueToCompareWith;
@@ -266,10 +320,6 @@ public class OOBuildStep extends Builder {
         return matchStrategy;
     }
 
-    public Boolean getChangeBuildResult() {
-        return changeBuildResult;
-    }
-
     public String getRetVariableToCheck() {
         return retVariableToCheck;
     }
@@ -281,7 +331,7 @@ public class OOBuildStep extends Builder {
     @Extension
     public static final class DescriptorImpl extends BuildStepDescriptor<Builder> {
 
-        //for Musca, Lucian-Cristian who wanted an easy way to configure 10 minutes as default timeout
+        //for Musca, Lucian-Cristian who wanted an easy way to configure 10 minutes as default stepExecutionTimeout
         public static final int DEFAULT_TIMEOUT = 600;
 
         private Map<String, OOServer> ooServers;
@@ -319,7 +369,7 @@ public class OOBuildStep extends Builder {
             if (filterOnlyActive) {
                 CollectionUtils.filter(copy.entrySet(), new MapValueCriteria<String, OOServer>(
                         new Criteria<OOServer>() {
-                            @Override
+
                             public boolean isSuccessful(OOServer tested) {
                                 return tested.isActive();
                             }
@@ -339,7 +389,7 @@ public class OOBuildStep extends Builder {
             }
             final List<OOFlow> flows = server.getFlows(basepath);
             return CollectionUtils.map(flows, new Handler<String, OOFlow>() {
-                @Override
+
                 public String apply(OOFlow node) {
                     return node.getId();
                 }
@@ -369,7 +419,7 @@ public class OOBuildStep extends Builder {
         @Override
         public boolean configure(StaplerRequest req, JSONObject json) throws FormException {
 
-            setTimeout(json.getInt("timeout"));
+//            setStepExecutionTimeout(json.getInt("stepExecutionTimeout"));
             setIgnoreSsl(json.getBoolean("ignoreSsl"));
             setKeystorePassword(json.getString("keystorePassword"));
             setKeystorePath(json.getString("keystorePath"));
@@ -384,13 +434,13 @@ public class OOBuildStep extends Builder {
 
             //handle array
             else if (ooServersConfigs instanceof JSONArray) {
-                final JSONArray ooServerConfigsArray = (JSONArray)ooServersConfigs;
+                final JSONArray ooServerConfigsArray = (JSONArray) ooServersConfigs;
 
                 final int configsCount = ooServerConfigsArray.size();
                 ooServers = new HashMap<String, OOServer>(configsCount);
                 serversConfigurationExceptions = new ArrayList<Exception>(configsCount);
 
-                for (int i = 0; i < configsCount ; i++) {
+                for (int i = 0; i < configsCount; i++) {
                     JSONObject ooServerConfig = (JSONObject) ooServerConfigsArray.get(i);
                     Exception serverConfigurationException = handleSingleServerConfig(i, ooServerConfig);
                     if (serverConfigurationException != null) {
@@ -402,10 +452,10 @@ public class OOBuildStep extends Builder {
             //handle single instance
             else if (ooServersConfigs instanceof JSONObject) {
 
-                final JSONObject ooServerConfig = (JSONObject)ooServersConfigs;
+                final JSONObject ooServerConfig = (JSONObject) ooServersConfigs;
                 ooServers = new HashMap<String, OOServer>(1);
                 serversConfigurationExceptions = new ArrayList<Exception>(1);
-                Exception serverConfigurationException = handleSingleServerConfig(0,ooServerConfig);
+                Exception serverConfigurationException = handleSingleServerConfig(0, ooServerConfig);
                 if (serverConfigurationException != null) {
                     serversConfigurationExceptions.add(serverConfigurationException);
                 }
@@ -414,7 +464,7 @@ public class OOBuildStep extends Builder {
             save();
             initializeHttpClient(this);
 
-            ((OOAdministrativeMonitor)Jenkins.getInstance().getAdministrativeMonitor(
+            ((OOAdministrativeMonitor) Jenkins.getInstance().getAdministrativeMonitor(
                     OOAdministrativeMonitor.MONITOR_ID)).setUrlConfigurationErrors(serversConfigurationExceptions);
 
             return super.configure(req, json);
@@ -439,8 +489,7 @@ public class OOBuildStep extends Builder {
             //make sure it's a valid URL
             try {
                 new URL(inputUrl);
-            }
-            catch (MalformedURLException mue) {
+            } catch (MalformedURLException mue) {
                 ret = new FormException("The URL " + inputUrl + " is not a valid URL.", "hostUrl");
             }
 
@@ -451,12 +500,12 @@ public class OOBuildStep extends Builder {
                     encrypt(ooServerConfig.getString("password")),
                     ret == null         //the configuration should be activated if there were no exceptions
             );
-            
+
             // Check that the new new OO server about to add has a unique URL
             boolean isUniqueURL = true;
             for (String key : ooServers.keySet()) {
                 if ((inputUrl != null) && (ooServers.get(key) != null) &&
-                        (inputUrl.equals(ooServers.get(key).getUrl())) ) {
+                        (inputUrl.equals(ooServers.get(key).getUrl()))) {
                     isUniqueURL = false;
                     break;
                 }
@@ -526,7 +575,6 @@ public class OOBuildStep extends Builder {
         }
 
         /**
-         *
          * @return the plugin's truststore absolute path or null if no additional trustore is defined
          */
         public String getKeystorePath() {
@@ -553,78 +601,214 @@ public class OOBuildStep extends Builder {
     @Override
     public boolean perform(AbstractBuild<?, ?> build, Launcher launcher, BuildListener listener) throws InterruptedException, IOException {
 
-        final List<OOArg> argsToUse = expand(getArgs(), build, listener);
+        final List<OOArg> argsToUse = expand(getArgs(), (AbstractBuild<MatrixProject, MatrixBuild>) build, listener);
+
+
+
+        Map<String,String> buildVariables = build.getBuildVariables();
+        Set<String> keySet = buildVariables.keySet();
+
+        OOServer selectedOOServer = getOOServer();
+        String selectedFlowS=this.selectedFlow;
+        for (String key : keySet) {
+
+            if (key.startsWith("i_")) {
+                argsToUse.add(new OOArg(key.substring(2), buildVariables.get(key)));
+                listener.getLogger().println("adding input " + key.substring(2) + " with value " + buildVariables.get(key) + " from the matrix axis");
+            }
+
+            if (key.startsWith("s_")) {
+                selectedOOServer = OOAccessibilityLayer.getOOServer(buildVariables.get(key));
+            }
+
+            if (key.startsWith("f_")) {
+                selectedFlowS = basepath + "/" + buildVariables.get(key);
+            }
+        }
+
+        Assert.isTrue(selectedOOServer != null, "HP Operations Orchestration Server must be selected");
+
+        listener.getLogger().println("Connected to central with label: [" + selectedOOServer.getUniqueLabel() + "], URL: ["+selectedOOServer.getUrl()+"]");
+        URL url = new URL(selectedOOServer.getUrl());
+
+        String urlString = StringUtils.slashify(selectedOOServer.getUrl().replace("PAS", "")) + "oo/rest/v1";
+
+        final DescriptorImpl descriptor = getDescriptorStatically();
+
+        if (selectedOOServer.getUsername() != null && selectedOOServer.getUsername().length() > 0) {
+            listener.getLogger().println("Authentication will be used, username: " + selectedOOServer.getUsername());
+            setEncodedCredentials(selectedOOServer.getUsername(), selectedOOServer.getPassword());
+        } else {
+            setEncodedCredentials(null, null);
+        }
+
+        // get version from Central
+        Boolean is9x = OOAccessibilityUtils.isOoVersionLowerThen1010(urlString + "/version");
+
+        // log version
+        //listener.getLogger().println("Central version: " + version);
+        //listener.getLogger().println("Global Keystore: " + globalKeystore);
+
         listener.getLogger().println(
-                "running " + this.selectedFlow +
-                        " on " + this.ooServer +
-                        " with parameters " + argsToUse);
+                "Running " + selectedFlowS +
+                        " on " + selectedOOServer.getUniqueLabel() +
+                        " with parameters " + argsToUse
+        );
 
-        final OOServer selectedOOServer = getOOServer();
 
-        OORunRequest runRequest = null;
-        OORunResponse ooBuildStepResult = null;
-        try {
-            runRequest = new OORunRequest(
-                    selectedOOServer,
-                    new OOFlow(selectedFlow),
-                    argsToUse);
-            ooBuildStepResult = OOAccessibilityLayer.run(runRequest);
-        }
-        catch (Exception e) {
-            e.printStackTrace(listener.getLogger());
-            if (abortBuildOnRunFailure) {
-                throw new AbortException("build step failed: " + e.getMessage());
-            }
-        }
+        // legacy invoke of a flow
+        if (is9x) {
+            OORunRequest runRequest = null;
+            OORunResponse ooBuildStepResult = null;
+            try {
+                runRequest = new OORunRequest(
+                        selectedOOServer,
+                        new OOFlow(selectedFlowS),
+                        argsToUse);
 
-        if (ooBuildStepResult != null) {
-
-            listener.getLogger().println("flow results:");
-            JAXB.marshal(ooBuildStepResult, listener.getLogger());
-
-            final EnvVars envVars = mapReturnValues(ooBuildStepResult, listener);
-            build.addAction(new OOBuildStepResultsEnvironmentInjectionAction(envVars));
-
-            if (ooBuildStepResult.hasReport()) {
-                build.addAction(new OOBuildStepResultReportAction(runRequest, ooBuildStepResult));
+                ooBuildStepResult = OOAccessibilityLayer.run(runRequest);
+            } catch (Exception e) {
+                e.printStackTrace(listener.getLogger());
+                if (abortBuildOnRunFailure) {
+                    throw new AbortException("build step failed: " + e.getMessage());
+                }
             }
 
-            if (getChangeBuildResult()) {
+            if (ooBuildStepResult != null) {
 
-                final String serverReturnedValue = envVars.get(getRetVariableToCheck());
-                if (serverReturnedValue == null) {
-                    throw new AbortException("could not check value of variable '" + getRetVariableToCheck() +
-                            "' - flow execution returned no such variable from the server.");
+                listener.getLogger().println("flow results:");
+                JAXB.marshal(ooBuildStepResult, listener.getLogger());
+
+                final EnvVars envVars = mapReturnValues(ooBuildStepResult, listener);
+                build.addAction(new OOBuildStepResultsEnvironmentInjectionAction(envVars));
+
+                if (ooBuildStepResult.hasReport()) {
+//                    build.addAction(new OOBuildStepResultReportAction(runRequest.getFlow().getId(), ooBuildStepResult.getReportUrl()));
+                    build.addAction(new OOBuildStepResultReportAction(ooBuildStepResult.getReportUrl()));
+                }
+                listener.getLogger().println("***" + getRetVariableToCheck() + "***");
+
+                if (getRetVariableToCheck().length()>0) {
+
+                    final String serverReturnedValue = envVars.get(getRetVariableToCheck());
+                    if (serverReturnedValue == null) {
+                        throw new AbortException("could not check value of variable '" + getRetVariableToCheck() +
+                                "' - flow execution returned no such variable from the server.\n");
+                    } else if (getMatchStrategy().matches(serverReturnedValue, getValueToCompareWith())) {
+                        listener.getLogger().println("changing status of build to " + getDesiredResultType() + " because " +
+                                "value of " +
+                                getRetVariableToCheck() + " (=" + serverReturnedValue + ") " +
+                                getMatchStrategy() + " " + getValueToCompareWith() + "\n");
+
+                        build.setResult(getDesiredResultType());
+
+                        if (getDesiredResultType().equals(Result.FAILURE)) {
+                            throw new AbortException("Aborting the build because flow failed and FAILURE was chosen.\n");
+                        }
+                    }
+
                 }
 
-                else if (getMatchStrategy().matches(serverReturnedValue, getValueToCompareWith())) {
-                    listener.getLogger().println("changing status of build to " + getDesiredResultType() + " because " +
-                            "value of " +
-                            getRetVariableToCheck() + " (=" + serverReturnedValue + ") " +
-                            getMatchStrategy() + " " + getValueToCompareWith());
 
-                    build.setResult(getDesiredResultType());
+                //Set build status according to run status
+                if (envVars.get("flowReturnCode").equals("Error")){
+                    listener.annotate(new SimpleHtmlNote("<font color=\"red\"><b>Run ended with status ["+envVars.get("flowReturnCode")+"] changing the build result to "+Result.FAILURE+"</b></font>\n"));
+                    build.setResult(Result.FAILURE);
+                }else if (ExecutionResult.NO_ACTION_TAKEN.equals(envVars.get("flowReturnCode").equals("No Action"))){
+                    listener.annotate(new SimpleHtmlNote("<font color=\"yellow\"><b>Run ended with status ["+envVars.get("flowReturnCode")+"] changing the build result to "+Result.UNSTABLE+"</b></font>\n"));
+                    build.setResult(Result.UNSTABLE);
+                }
 
-                    if (getDesiredResultType().equals(Result.FAILURE)) {
-                        throw new AbortException("Aborting the build because flow failed and FAILURE was chosen.");
+
+            }
+        } else {
+
+            // post 10.10 invoke of a flow
+            // get UUID of the selected flow
+
+            String selectedFlowUUID = OOAccessibilityUtils.getFlowID10x(selectedFlowS, urlString + "/flows/library");
+            listener.getLogger().println("The flow: " + selectedFlowS + " with UUID " + selectedFlowUUID + " is executing...");
+            listener.getLogger().getClass();
+            OOAccessibilityLayer ooAccessibilityLayer = new OOAccessibilityLayer();
+
+            String runName = resolveParametersInString(build, listener, this.runName);
+
+            //trigger the flow
+            TriggeredExecutionDetailsVO triggeredExecutionDetailsVO = ooAccessibilityLayer.run10x(selectedFlowUUID, argsToUse, urlString, stepExecutionTimeout, listener, runName);
+
+            //Create report with link to run on OO
+            build.addAction(new OOBuildStepResultReportAction(ooAccessibilityLayer.runURL));
+
+            //Wait for completion
+            WaitExecutionResult waitExecutionResult = ooAccessibilityLayer.waitExecutionComplete(triggeredExecutionDetailsVO, stepExecutionTimeout, listener, urlString);
+
+            //get step log
+            List<StepLog> stepLog = ooAccessibilityLayer.getStepLog(waitExecutionResult.getStepCount(),triggeredExecutionDetailsVO.getFeedUrl());
+
+            //Handle build result
+            if (waitExecutionResult.isTimedOut()){//if timed out
+                listener.annotate(new SimpleHtmlNote("\n<font color=\"red\"><b>Timeout failure: The execution was not completed in the allotted time.\nLast status was: "+waitExecutionResult.getLastExecutionStatus()+" </b></font> \n\n"));
+                build.setResult(Result.FAILURE);
+            }else{//No time out
+                listener.getLogger().println("Run ended with status ["+waitExecutionResult.getFullStatusName()+"]");
+                if (!ExecutionStatusState.COMPLETED.equals(waitExecutionResult.getLastExecutionStatus())){//If flow wasn't completed
+                    listener.annotate(new SimpleHtmlNote("<font color=\"red\"><b>Run was not completed, changing the build result to "+Result.FAILURE+"</b></font>\n"));
+
+                    build.setResult(Result.FAILURE);
+                }else{//flow was completed
+                    //Set build status according to run outputs
+                    if (stepLog.size()>0){
+                        StepLog lastStep = stepLog.get(stepLog.size()-1);
+                        Map<String,String> lastRawResults = lastStep.getRawResult();
+                        if (lastRawResults!=null && lastRawResults.get(getRetVariableToCheck())!=null && !getRetVariableToCheck().isEmpty()){ //if run has the expected output
+                            if (getMatchStrategy().matches(lastRawResults.get(getRetVariableToCheck()), getValueToCompareWith())) {
+                                listener.getLogger().println("changing status of build to " + getDesiredResultType() + " because " +
+                                        "value of " +
+                                        getRetVariableToCheck() + " (" + lastRawResults.get(getRetVariableToCheck()) + ") " +
+                                        getMatchStrategy() + " expected value of " + getValueToCompareWith());
+
+                                build.setResult(getDesiredResultType());
+                            }
+                        }else if (!getRetVariableToCheck().isEmpty()){ //flow output is empty or output wasn't found
+                            listener.annotate(new SimpleHtmlNote("<font color=\"red\"><b>could not check value of variable '" + getRetVariableToCheck() +
+                                    "' - flow execution returned no such variable from the server.</b></font>\n"));
+                        }
+                    }
+                    //Set build status according to run status
+                    if (ExecutionResult.ERROR.equals(waitExecutionResult.getLastExecutionResult())){
+                        //Print stack trace
+                        List<StepLog> stackTrace = ooAccessibilityLayer.createStackTrace(stepLog, "0");
+                        listener.annotate(new SimpleHtmlNote(ooAccessibilityLayer.stackTraceAsString(stackTrace)));
+
+                        listener.annotate(new SimpleHtmlNote("<font color=\"red\"><b>Run ended with status ["+waitExecutionResult.getLastExecutionResult()+"] changing the build result to "+Result.FAILURE+"</b></font>\n"));
+                        build.setResult(Result.FAILURE);
+                    }else if (ExecutionResult.NO_ACTION_TAKEN.equals(waitExecutionResult.getLastExecutionResult())){
+                        listener.annotate(new SimpleHtmlNote("<font color=\"yellow\"><b>Run ended with status ["+waitExecutionResult.getLastExecutionResult()+"] changing the build result to "+Result.UNSTABLE+"</b></font>\n"));
+                        build.setResult(Result.UNSTABLE);
                     }
                 }
-
             }
+
+            //print the steps (convert step log to json)
+//            listener.annotate(new SimpleHtmlNote(ooAccessibilityLayer.formatResult(jsonExecutionResult)));
+
         }
 
-        //calling super throws exception?
         return true;
     }
 
-    private List<OOArg> expand(List<OOArg> args, AbstractBuild<?, ?> build, BuildListener listener) throws IOException, InterruptedException {
+    private List<OOArg> expand(List<OOArg> args, AbstractBuild<MatrixProject, MatrixBuild> build, BuildListener listener) throws IOException, InterruptedException {
 
         if (args != null) {
             List<OOArg> expanded = new ArrayList<OOArg>(args.size());
             EnvVars env = build.getEnvironment(listener);
 
-            for (OOArg arg: args) {
+            AbstractProject project = build.getProject();
+            listener.getLogger().println("Project name" + project.getDisplayName());
 
+            Map<AbstractProject,Integer> map= build.getUpstreamBuilds();
+
+            for (OOArg arg : args) {
 
                 final String name = arg.getName();
                 final String value = arg.getValue();
@@ -641,6 +825,10 @@ public class OOBuildStep extends Builder {
             }
 
             return expanded;
+        } else {
+            // we need an arg even for a no-arg run : QCCR 24513
+            args = new ArrayList<OOArg>();
+            //args.add(0, new OOArg("defaultParamName", "defaultParamValue"));
         }
         return args;
     }
@@ -669,9 +857,7 @@ public class OOBuildStep extends Builder {
                     url.getPath(),
                     url.getQuery(),
                     null);
-        }
-
-        catch(Exception e) {
+        } catch (Exception e) {
             throw new RuntimeException(e);
         }
     }
@@ -695,5 +881,27 @@ public class OOBuildStep extends Builder {
         return password.startsWith("MD5:");
     }
 
+    public void setStepExecutionTimeout(String stepExecutionTimeout){
+        this.stepExecutionTimeout = stepExecutionTimeout;
+    }
+
+    public String getStepExecutionTimeout(){
+        return stepExecutionTimeout;
+    }
+
+    public String getRunName(){
+        return runName;
+    }
+
+
+    protected String resolveParametersInString(Run<?, ?> build, TaskListener listener, String input) {
+        try {
+            return build.getEnvironment(listener).expand(input);
+        } catch (Exception e) {
+            listener.getLogger().println("Failed to resolve parameters in string \""+
+                    input+"\" due to following error:\n"+e.getMessage());
+        }
+        return input;
+    }
 
 }
